@@ -24,6 +24,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
 import java.lang.String;
 import java.util.Map;
 import java.util.HashMap;
@@ -33,11 +36,6 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import org.osgi.framework.Bundle;
-import org.osgi.framework.BundleContext;
-import org.osgi.framework.BundleException;
-import org.osgi.framework.FrameworkUtil;
 import org.opendaylight.controller.sal.core.ConstructionException;
 import org.opendaylight.controller.sal.core.Node;
 import org.opendaylight.controller.sal.core.NodeConnector;
@@ -46,7 +44,6 @@ import org.opendaylight.controller.sal.flowprogrammer.Flow;
 import org.opendaylight.controller.sal.packet.ARP;
 import org.opendaylight.controller.sal.packet.BitBufferHelper;
 import org.opendaylight.controller.sal.packet.Ethernet;
-import org.opendaylight.controller.sal.packet.ICMP;
 import org.opendaylight.controller.sal.packet.IDataPacketService;
 import org.opendaylight.controller.sal.packet.IListenDataPacket;
 import org.opendaylight.controller.sal.packet.Packet;
@@ -70,8 +67,8 @@ public class TutorialL2Forwarding implements IListenDataPacket {
     private ISwitchManager switchManager = null;
     private IFlowProgrammerService programmer = null;
     private IDataPacketService dataPacketService = null;
-    private Map<Long, NodeConnector> mac_to_port = new HashMap<Long, NodeConnector>();
-    private String function = "hub";
+    private Map<Node, Map<Long, NodeConnector>> mac_to_port_per_switch = new HashMap<Node, Map<Long, NodeConnector>>();
+    private String function = "switch";
 
     void setDataPacketService(IDataPacketService s) {
         this.dataPacketService = s;
@@ -113,18 +110,6 @@ public class TutorialL2Forwarding implements IListenDataPacket {
      */
     void init() {
         logger.info("Initialized");
-        // Disabling the SimpleForwarding and ARPHandler bundle to not conflict with this one
-        BundleContext bundleContext = FrameworkUtil.getBundle(this.getClass()).getBundleContext();
-        for(Bundle bundle : bundleContext.getBundles()) {
-            if (bundle.getSymbolicName().contains("simpleforwarding")) {
-                try {
-                    bundle.uninstall();
-                } catch (BundleException e) {
-                    logger.error("Exception in Bundle uninstall "+bundle.getSymbolicName(), e); 
-                }   
-            }   
-        }   
- 
     }
 
     /**
@@ -176,79 +161,106 @@ public class TutorialL2Forwarding implements IListenDataPacket {
         }
     }
 
-
-
     @Override
     public PacketResult receiveDataPacket(RawPacket inPkt) {
         if (inPkt == null) {
             return PacketResult.IGNORED;
         }
+        long ptStart = System.nanoTime();
+        logger.trace("Received a frame of size: {}",
+                        inPkt.getPacketData().length);
 
+        Packet formattedPak = this.dataPacketService.decodeDataPacket(inPkt);
         NodeConnector incoming_connector = inPkt.getIncomingNodeConnector();
-
-        // Hub implementation
-        if (function.equals("hub")) {
-            floodPacket(inPkt);
-        } else {
-            Packet formattedPak = this.dataPacketService.decodeDataPacket(inPkt);
-            if (!(formattedPak instanceof Ethernet)) {
-                return PacketResult.IGNORED;
-            }
-
-            learnSourceMAC(formattedPak, incoming_connector);
-            NodeConnector outgoing_connector = 
-                knowDestinationMAC(formattedPak);
-            if (outgoing_connector == null) {
-                floodPacket(inPkt);
-            } else {
-                if (!programFlow(formattedPak, incoming_connector,
-                            outgoing_connector)) {
-                    return PacketResult.IGNORED;
-                }
-                inPkt.setOutgoingNodeConnector(outgoing_connector);
-                this.dataPacketService.transmitDataPacket(inPkt);
-            }
-        }
-        return PacketResult.CONSUME;
-    }
-
-    private void learnSourceMAC(Packet formattedPak, NodeConnector incoming_connector) {
-        byte[] srcMAC = ((Ethernet)formattedPak).getSourceMACAddress();
-        long srcMAC_val = BitBufferHelper.toNumber(srcMAC);
-        this.mac_to_port.put(srcMAC_val, incoming_connector);
-    }
-
-    private NodeConnector knowDestinationMAC(Packet formattedPak) {
-        byte[] dstMAC = ((Ethernet)formattedPak).getDestinationMACAddress();
-        long dstMAC_val = BitBufferHelper.toNumber(dstMAC);
-        return this.mac_to_port.get(dstMAC_val) ;
-    }
-
-    private boolean programFlow(Packet formattedPak, 
-            NodeConnector incoming_connector, 
-            NodeConnector outgoing_connector) {
-        byte[] dstMAC = ((Ethernet)formattedPak).getDestinationMACAddress();
-
-        Match match = new Match();
-        match.setField( new MatchField(MatchType.IN_PORT, incoming_connector) );
-        match.setField( new MatchField(MatchType.DL_DST, dstMAC.clone()) );
-
-        List<Action> actions = new ArrayList<Action>();
-        actions.add(new Output(outgoing_connector));
-
-        Flow f = new Flow(match, actions);
-        f.setIdleTimeout((short)5);
-
-        // Modify the flow on the network node
         Node incoming_node = incoming_connector.getNode();
-        Status status = programmer.addFlow(incoming_node, f);
 
-        if (!status.isSuccess()) {
-            logger.warn("SDN Plugin failed to program the flow: {}. The failure is: {}",
-                    f, status.getDescription());
-            return false;
-        } else {
-            return true;
+        if (formattedPak instanceof Ethernet) {
+            byte[] srcMAC = ((Ethernet)formattedPak).getSourceMACAddress();
+            byte[] dstMAC = ((Ethernet)formattedPak).getDestinationMACAddress();
+
+            // Hub implementation
+            if (function.equals("hub")) {
+                floodPacket(inPkt);
+                return PacketResult.CONSUME;
+            }
+
+            // Switch
+            else {
+                long srcMAC_val = BitBufferHelper.toNumber(srcMAC);
+                long dstMAC_val = BitBufferHelper.toNumber(dstMAC);
+
+                Match match = new Match();
+                match.setField( new MatchField(MatchType.IN_PORT, incoming_connector) );
+                match.setField( new MatchField(MatchType.DL_DST, dstMAC.clone()) );
+
+                // Set up the mapping: switch -> src MAC address -> incoming port
+                if (this.mac_to_port_per_switch.get(incoming_node) == null) {
+                    this.mac_to_port_per_switch.put(incoming_node, new HashMap<Long, NodeConnector>());
+                }
+                this.mac_to_port_per_switch.get(incoming_node).put(srcMAC_val, incoming_connector);
+
+                NodeConnector dst_connector = this.mac_to_port_per_switch.get(incoming_node).get(dstMAC_val);
+
+                // Do I know the destination MAC?
+                if (dst_connector != null) {
+
+                    List<Action> actions = new ArrayList<Action>();
+                    actions.add(new Output(dst_connector));
+
+                    Flow f = new Flow(match, actions);
+
+                    // Modify the flow on the network node
+                    Status status = programmer.addFlow(incoming_node, f);
+                    if (!status.isSuccess()) {
+                        logger.warn(
+                                "SDN Plugin failed to program the flow: {}. The failure is: {}",
+                                f, status.getDescription());
+                        return PacketResult.IGNORED;
+                    }
+                    logger.info("Installed flow {} in node {}",
+                            f, incoming_node);
+                    logFlowMod(ptStart, System.nanoTime(), inPkt);
+                }
+                else 
+                    floodPacket(inPkt);
+                	logPO(ptStart, System.nanoTime(), inPkt);
+            }
         }
+        return PacketResult.IGNORED;
     }
+
+	private void logPO(long ptStart, long ptEnt, RawPacket inPkt) {
+		long processingTime = ptEnt - ptStart;
+		
+		String PO_FILE = "po_"+ inPkt.getIncomingNodeConnector().getNode().getNodeIDString() + ".txt";
+		if (processingTime < 0 ) {
+			processingTime = processingTime * -1;
+		}
+		writeToFile(processingTime, PO_FILE);
+	}
+
+	private void logFlowMod(long ptStart, long ptEnd, RawPacket inPkt) {
+		long processingTime = ptEnd - ptStart;
+		
+		String FM_FILE = "fm_"+ inPkt.getIncomingNodeConnector().getNode().getNodeIDString() + ".txt";
+		if (processingTime < 0 ) {
+			processingTime = processingTime * -1;
+		}
+		writeToFile(processingTime, FM_FILE);
+	}
+	
+
+	private void writeToFile(long processingTime, String filename) {
+		//try with resources, tries to write and closes after completion
+		try (
+				FileWriter fstream = new FileWriter(filename, true);
+				BufferedWriter writer = new BufferedWriter(fstream)
+		) {
+				writer.write(Long.toString(processingTime) + ";\n");
+
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+//		
+	}
 }
